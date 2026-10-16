@@ -1,0 +1,315 @@
+'use strict';
+// Instagram Messaging via "Instagram API with Instagram Login".
+//
+// Rules this module respects (Meta platform constraints):
+//  - the customer must message first; after that we may reply freely for 24 hours
+//  - after 24h only a human can reply, using the HUMAN_AGENT tag, for up to 7 days
+//  - text messages are limited to 1000 characters
+//  - webhooks are signed with the app secret (X-Hub-Signature-256)
+//
+// Lead identity: the enquiry form sends people to https://ig.me/m/<handle>?ref=<token>.
+// Instagram echoes that ref back in a referral webhook, which ties the DM
+// conversation to the lead created at form submit.
+
+const crypto = require('node:crypto');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const WINDOW_MS = 24 * 3600 * 1000;
+const HUMAN_AGENT_MS = 7 * 24 * 3600 * 1000;
+const MAX_TEXT = 950;
+const IMAGE_HOSTS = /(^|\.)(fbsbx\.com|cdninstagram\.com|fbcdn\.net|instagram\.com)$/i;
+const MAX_IMAGE_BYTES = 4 * 1024 * 1024; // Vercel returns at most about 4.5 MB per response, so anything bigger could never be shown
+// Attachments a customer really sent (as opposed to empty companion events, hearts and the like).
+const MEDIA = { image: 'a photo', video: 'a video', audio: 'a voice note', file: 'a file', share: 'a post', ig_reel: 'a reel', reel: 'a reel', story_mention: 'a story', ig_story: 'a story' }; // under the 1000 character limit, with headroom for multibyte text
+
+class InstagramError extends Error {
+  constructor(msg, { permanent = false, status = 0, code = 0 } = {}) { super(msg); this.permanent = permanent; this.status = status; this.code = code; }
+}
+
+function chunk(text, size = MAX_TEXT) {
+  const out = [];
+  let rest = String(text);
+  while (rest.length > size) {
+    let cut = Math.max(rest.lastIndexOf('. ', size), rest.lastIndexOf('\n', size), rest.lastIndexOf(' ', size));
+    if (cut < size * 0.4) cut = size;
+    out.push(rest.slice(0, cut + 1).trim());
+    rest = rest.slice(cut + 1).trimStart();
+  }
+  if (rest) out.push(rest);
+  return out;
+}
+
+class Instagram {
+  constructor({ cfg, engine, store, config, log = console, fetchImpl }) {
+    this.cfg = cfg;
+    this.engine = engine;
+    this.store = store;
+    this.config = config;
+    this.log = log;
+    this.fetch = fetchImpl || globalThis.fetch;
+    this.me = null;
+    this.status = { enabled: !!cfg.accessToken, connected: false, lastWebhookAt: null, lastError: null, webhookSigned: !!cfg.appSecret };
+  }
+
+  get enabled() { return !!(this.cfg.accessToken || this.storedToken); }
+  // A refreshed token (stored by refreshToken, shared through the database) wins over the one in the environment.
+  get token() { return this.storedToken || this.cfg.accessToken; }
+  async loadToken({ maxAgeMs = 60000 } = {}) {
+    if (this.tokenLoadedAt && Date.now() - this.tokenLoadedAt < maxAgeMs) return this.token;
+    this.storedToken = await this.store.kvGet('ig_token', null);
+    this.tokenLoadedAt = Date.now();
+    return this.token;
+  }
+  get handle() { return (this.me && this.me.username) || this.cfg.handle || null; }
+  get base() { return `https://graph.instagram.com/${this.cfg.apiVersion}`; }
+  chatLink(ref) { return this.handle ? `https://ig.me/m/${this.handle}${ref ? `?ref=${encodeURIComponent(ref)}` : ''}` : null; }
+
+  // ---------- Graph API ----------
+  async api(method, path, { body, query } = {}, { retries = 3 } = {}) {
+    await this.loadToken();
+    if (!this.token) throw new InstagramError('Instagram is not configured', { permanent: true });
+    const qs = query ? `?${new URLSearchParams(query)}` : '';
+    let lastErr;
+    for (let attempt = 0; attempt < retries; attempt++) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 15000);
+      try {
+        const res = await this.fetch(`${path.startsWith('http') ? path : this.base + path}${qs}`, {
+          method,
+          headers: { Authorization: `Bearer ${this.token}`, 'Content-Type': 'application/json' },
+          body: body ? JSON.stringify(body) : undefined,
+          signal: ctrl.signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && !data.error) return data;
+        const e = data.error || {};
+        const msg = e.message || `HTTP ${res.status}`;
+        const code = e.code || 0;
+        // 190 = token invalid/expired, 10/200 = permission, 100 = bad request, 551/2534014 = user unreachable, 613/4/17/32 = rate limits
+        const rateLimited = [4, 17, 32, 613].includes(code) || res.status === 429;
+        if (rateLimited) { lastErr = new InstagramError(msg, { status: res.status, code }); await sleep(1500 * 2 ** attempt); continue; }
+        if (res.status >= 500) { lastErr = new InstagramError(msg, { status: res.status, code }); await sleep(500 * 2 ** attempt); continue; }
+        throw new InstagramError(msg, { permanent: true, status: res.status, code });
+      } catch (e) {
+        if (e instanceof InstagramError && e.permanent) throw e;
+        lastErr = e instanceof InstagramError ? e : new InstagramError(e.name === 'AbortError' ? 'Instagram request timed out' : e.message);
+        await sleep(500 * 2 ** attempt);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw lastErr || new InstagramError('Instagram request failed');
+  }
+
+  async start() {
+    if (!this.enabled) { this.log.warn('[instagram] no INSTAGRAM_ACCESS_TOKEN, Instagram channel disabled'); return; }
+    try {
+      this.me = await this.api('GET', '/me', { query: { fields: 'user_id,username,name' } }, { retries: 2 });
+      this.status.connected = true;
+      this.status.lastError = null;
+      this.log.log(`[instagram] connected as @${this.me.username}`);
+      this.refreshToken().catch(() => {});
+      this.refreshTimer = setInterval(() => this.refreshToken().catch(() => {}), 24 * 3600 * 1000);
+      this.refreshTimer.unref?.();
+    } catch (e) {
+      this.status.connected = false;
+      this.status.lastError = e.message;
+      this.log.error('[instagram] could not connect:', e.message);
+    }
+  }
+
+  // Long-lived tokens last 60 days and can be refreshed once they are 24h old.
+  async refreshToken({ force = false } = {}) {
+    await this.loadToken({ maxAgeMs: 0 });
+    const info = await this.store.kvGet('ig_token_info', {});
+    if (!force && info.refreshedAt && Date.now() - info.refreshedAt < 7 * 24 * 3600 * 1000) return { skipped: true };
+    const res = await this.fetch(`https://graph.instagram.com/refresh_access_token?${new URLSearchParams({ grant_type: 'ig_refresh_token', access_token: this.token })}`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.access_token) throw new InstagramError((data.error && data.error.message) || 'Token refresh failed', { permanent: true });
+    await this.store.kvSet('ig_token', data.access_token);
+    this.storedToken = data.access_token;
+    await this.store.kvSet('ig_token_info', { refreshedAt: Date.now(), expiresAt: Date.now() + (data.expires_in || 5184000) * 1000 });
+    return { refreshed: true, expires_in: data.expires_in };
+  }
+
+  tokenInfo() { return this.store.kvGet('ig_token_info', {}); }
+
+  // Subscribe this account to the webhook fields we handle.
+  async subscribe() {
+    const id = (this.me && this.me.user_id) || 'me';
+    return this.api('POST', `/${id}/subscribed_apps`, { query: { subscribed_fields: 'messages,messaging_postbacks,messaging_referral' } });
+  }
+
+  // Tappable conversation starters shown when someone opens the DM thread.
+  async setIceBreakers(questions) {
+    const qs = (questions || []).map((q) => String(q).trim()).filter(Boolean).slice(0, 4);
+    if (!qs.length) throw new InstagramError('Add at least one conversation starter', { permanent: true });
+    return this.api('POST', '/me/messenger_profile', {
+      body: { platform: 'instagram', ice_breakers: [{ call_to_actions: qs.map((q) => ({ question: q.slice(0, 80), payload: q.slice(0, 80) })), locale: 'default' }] },
+    });
+  }
+
+  async profile(igsid) {
+    try { return await this.api('GET', `/${igsid}`, { query: { fields: 'name,username' } }, { retries: 1 }); } catch { return {}; }
+  }
+
+  // ---------- sending ----------
+  igsid(lead) { return String(lead.chat_id).replace(/^ig:/, ''); }
+
+  get transport() {
+    return {
+      send: (lead, text, opts = {}) => this.sendText(lead, text, opts),
+      typing: (chatId) => this.api('POST', '/me/messages', { body: { recipient: { id: String(chatId).replace(/^ig:/, '') }, sender_action: 'typing_on' } }, { retries: 1 }).catch(() => {}),
+      sendRaw: async () => {}, // team alerts go through Telegram or the webhook, not Instagram
+    };
+  }
+
+  async sendText(lead, text, { role } = {}) {
+    const age = Date.now() - (lead.last_inbound_at || 0);
+    let extra = {};
+    if (age > WINDOW_MS) {
+      if (role === 'admin' && age <= HUMAN_AGENT_MS) extra = { messaging_type: 'MESSAGE_TAG', tag: 'HUMAN_AGENT' };
+      else {
+        throw new InstagramError('Outside Instagram\'s 24 hour messaging window. Only a human can reply (up to 7 days after their last message) using Send from the lead view.', { permanent: true });
+      }
+    }
+    let last;
+    for (const part of chunk(text)) {
+      last = await this.api('POST', '/me/messages', { body: { recipient: { id: this.igsid(lead) }, message: { text: part }, ...extra } });
+    }
+    return last && last.message_id;
+  }
+
+  // Downloads a picture the customer sent. Only Meta's own image hosts are fetched, and only images up to 4 MB.
+  async fetchImage(url) {
+    let u;
+    try { u = new URL(url); } catch { return null; }
+    if (u.protocol !== 'https:' || !IMAGE_HOSTS.test(u.hostname)) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const res = await this.fetch(u.toString(), { signal: ctrl.signal });
+      if (!res.ok) return null;
+      const mime = String(res.headers && res.headers.get ? res.headers.get('content-type') || '' : '').split(';')[0].trim().toLowerCase();
+      const bytes = Buffer.from(await res.arrayBuffer());
+      if (!/^image\//.test(mime) || !bytes.length || bytes.length > MAX_IMAGE_BYTES) return null;
+      return { mime, bytes };
+    } catch { return null; } finally { clearTimeout(timer); }
+  }
+
+  // ---------- webhook ----------
+  verifyChallenge(query) {
+    if (query.get('hub.mode') === 'subscribe' && this.cfg.verifyToken && query.get('hub.verify_token') === this.cfg.verifyToken) return query.get('hub.challenge');
+    return null;
+  }
+
+  validSignature(raw, header) {
+    if (!this.cfg.appSecret) return false; // refuse unsigned webhooks: anyone could forge leads otherwise
+    if (!header || !header.startsWith('sha256=')) return false;
+    const expected = crypto.createHmac('sha256', this.cfg.appSecret).update(raw).digest('hex');
+    const got = header.slice(7);
+    return got.length === expected.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(expected));
+  }
+
+  // Which other deployments need this (already signature-checked) payload: [url, ...] and the same
+  // payload without the entries that belong to them.
+  split(payload) {
+    const fwd = this.cfg.forward || {};
+    const targets = new Set();
+    const mine = [];
+    for (const entry of (payload && payload.entry) || []) {
+      const url = fwd[String(entry.id)];
+      if (url) targets.add(url);
+      else if (!this.cfg.accountId || String(entry.id) === this.cfg.accountId) mine.push(entry); // events for accounts that are not ours are dropped
+    }
+    return { targets: [...targets], local: { ...payload, entry: mine } };
+  }
+
+  // Passes the ORIGINAL body and signature on untouched, so the receiving deployment verifies it itself.
+  async forward(url, raw, signature) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 12000);
+        const res = await this.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Hub-Signature-256': signature || '' }, body: raw, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+        if (res.ok) return true;
+        this.log.warn(`[instagram] forward to ${url} answered ${res.status}`);
+      } catch (e) { this.log.warn(`[instagram] forward to ${url} failed: ${e.message}`); }
+    }
+    return false;
+  }
+
+  // Processes a verified webhook payload. Never throws: Meta retries on non-200,
+  // and a poison event must not block the queue.
+  async handleWebhook(payload) {
+    this.status.lastWebhookAt = Date.now();
+    const events = [];
+    for (const entry of (payload && payload.entry) || []) {
+      for (const ev of entry.messaging || []) events.push({ ev, igId: String(entry.id || (ev.recipient && ev.recipient.id) || '') });
+    }
+    // Referrals first, so a message in the same batch lands on the right lead.
+    events.sort((a, b) => (b.ev.referral ? 1 : 0) - (a.ev.referral ? 1 : 0));
+    for (const { ev, igId } of events) {
+      try { await this.handleEvent(ev, igId); } catch (e) { this.log.error('[instagram] event failed', e); }
+    }
+  }
+
+  async handleEvent(ev, igId) {
+    const senderId = ev.sender && String(ev.sender.id);
+    if (!senderId || senderId === igId) return; // our own account
+    const chatId = `ig:${senderId}`;
+    const ref = (ev.referral && ev.referral.ref) || (ev.postback && ev.postback.referral && ev.postback.referral.ref) || (ev.message && ev.message.referral && ev.message.referral.ref) || null;
+
+    let profile = {};
+    const known = await this.store.getLeadByChat(chatId);
+    if (!known) profile = await this.profile(senderId);
+    const prof = { first_name: (profile.name || '').split(/\s+/)[0] || null, username: profile.username || null };
+
+    if (ref) await this.engine.linkReferral(chatId, ref, prof, 'instagram');
+
+    if (ev.message) {
+      if (ev.message.is_echo) return; // messages sent from our own account/app
+      const text = typeof ev.message.text === 'string' ? ev.message.text.trim() : '';
+      if (!text) {
+        const lead = (await this.store.getLeadByChat(chatId)) || (await this.engine.bindChat(chatId, prof, { channel: 'instagram', source: 'instagram' })).lead;
+        const types = (Array.isArray(ev.message.attachments) ? ev.message.attachments : []).map((a) => String((a && a.type) || '').toLowerCase());
+        const kind = types.find((t) => MEDIA[t]);
+        // Instagram also sends empty companion events (for example 0.4 seconds after a message that contains a
+        // phone number or a link), hearts and unsupported items. The customer did not send those, so they get no
+        // reply and no transcript line: only a note for diagnosis.
+        if (!kind) {
+          await this.store.addEvent(lead.id, 'non_text_ignored', { types, unsupported: !!ev.message.is_unsupported });
+          return;
+        }
+        // A photo is looked at and kept: the assistant answers what is in it and the picture shows in the CRM.
+        if (kind === 'image') {
+          const shots = (ev.message.attachments || []).filter((a) => a && String(a.type).toLowerCase() === 'image' && a.payload && a.payload.url).slice(0, 4);
+          let handled = 0;
+          for (const [i, a] of shots.entries()) {
+            const img = await this.fetchImage(a.payload.url);
+            if (!img) continue;
+            await this.engine.receiveImage({ channel: 'instagram', chatId, bytes: img.bytes, mime: img.mime, profile: prof, externalId: ev.message.mid ? `${ev.message.mid}${i ? `:${i}` : ''}` : null, token: ref });
+            handled++;
+          }
+          if (handled) return;
+        }
+        try { await this.store.addMessage({ lead_id: lead.id, direction: 'in', role: 'user', text: `[sent ${MEDIA[kind]}]`, ext_id: ev.message.mid || null, processed: true }); } catch { return; }
+        await this.store.updateLead(lead.id, { last_inbound_at: Date.now() });
+        const first = (lead.name || '').split(/\s+/)[0];
+        const reply = `Thanks${first ? `, ${first}` : ''}, I can see you sent ${MEDIA[kind]}. I cannot open attachments in this chat yet, so could you tell me in a few words what it shows or what you would like us to see? I will pass it to the team.`;
+        const id = await this.store.addMessage({ lead_id: lead.id, direction: 'out', role: 'assistant', text: reply, status: 'pending' });
+        await this.engine.deliver(id).catch(() => {});
+        return;
+      }
+      await this.engine.receive({ channel: 'instagram', chatId, text, profile: prof, externalId: ev.message.mid || null, token: ref });
+      return;
+    }
+    if (ev.postback) {
+      // Ice breaker taps arrive as postbacks; treat the tapped question as the customer's message.
+      const text = String(ev.postback.title || ev.postback.payload || '').trim();
+      if (text) await this.engine.receive({ channel: 'instagram', chatId, text, profile: prof, externalId: ev.postback.mid || null, token: ref });
+    }
+  }
+}
+
+module.exports = { Instagram, InstagramError, chunk, WINDOW_MS };
